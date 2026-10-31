@@ -35,7 +35,7 @@ const io = new Server(server, {
 });
 
 // ============================================================================
-// 1. FREE CRYPTOGRAPHIC PASSWORD HASHING (scrypt + timingSafeEqual) & RATE LIMITER
+// 1. CRYPTOGRAPHIC PASSWORD HASHING (scrypt + timingSafeEqual) & RATE LIMITER
 // ============================================================================
 const SERVER_SECRET =
   process.env.ORBIT_SECRET || "orbitlive_srm_trichy_2026_secret_key";
@@ -61,8 +61,7 @@ function verifyPasswordScrypt(inputPassword, storedHash) {
   return crypto.timingSafeEqual(inputHashBuf, storedHashBuf);
 }
 
-// Brute-force login protection (Blocks IP for 15 mins after 5 failed attempts)
-const loginAttempts = new Map(); // Map<ip, { count, lockUntil }>
+const loginAttempts = new Map();
 
 function checkRateLimit(ip) {
   const rec = loginAttempts.get(ip);
@@ -117,7 +116,6 @@ function verifySignedToken(token) {
   }
 }
 
-// Admin accounts store ONLY salted scrypt hashes in memory (never plaintext)
 const DEFAULT_ADMIN_PASS = process.env.ORBIT_ADMIN_PASSWORD || "ORBITADMIN";
 const ADMINS = [
   {
@@ -159,7 +157,7 @@ let globalAnnouncement = null;
 // ============================================================================
 // 2. SERVERLESS-SAFE SHARED TMP CACHE
 // ============================================================================
-const TMP_STATE_FILE = path.join(os.tmpdir(), "orbitlive_shared_state_v2.json");
+const TMP_STATE_FILE = path.join(os.tmpdir(), "orbitlive_shared_state_v3.json");
 const activeRouteSharers = new Map();
 const smoothedBusStates = new Map();
 const primaryBusDebug = new Map();
@@ -324,7 +322,7 @@ setTimeout(async () => {
 }, 100);
 
 // ============================================================================
-// 4. IST TIME & COMMUTE-WINDOW KEEP-ALIVE
+// 4. IST TIME HELPER
 // ============================================================================
 function getISTDate() {
   const now = new Date();
@@ -336,30 +334,14 @@ function isMorningTripActive() {
   return getISTDate().getHours() < 12;
 }
 
-function isCommuteWindowIST() {
-  const ist = getISTDate();
-  const mins = ist.getHours() * 60 + ist.getMinutes();
-  return (mins >= 375 && mins <= 555) || (mins >= 945 && mins <= 1110);
-}
-
-setInterval(async () => {
-  if (isCommuteWindowIST() && process.env.CLIENT_URL) {
-    try {
-      await fetch(new URL("/api/health", process.env.CLIENT_URL));
-    } catch {
-      // Ignore
-    }
-  }
-}, 480000);
-
 // ============================================================================
 // 5. GEOMETRY & ROUTE VALIDATION ENGINE
 // ============================================================================
 const MAX_ROUTE_CORRIDOR_METERS = 500;
 const SRM_CAMPUS_RADIUS_METERS = 1800;
 const MAX_BUS_DIVERGENCE_METERS = 450;
-const PING_TTL_MS = 16000;
-const MIN_USER_PING_INTERVAL_MS = 900;
+const PING_TTL_MS = 15000;
+const MIN_USER_PING_INTERVAL_MS = 700;
 
 function getDistanceMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000;
@@ -672,7 +654,7 @@ function computeBestBusTelemetry(routeNo) {
 }
 
 // ============================================================================
-// 7. LOCATION PING PROCESSOR
+// 7. LOCATION PING PROCESSOR (Strict Real GPS — Never Overwrites User Location)
 // ============================================================================
 function processLocationPing(payload) {
   loadStateFromTmpDisk();
@@ -692,9 +674,9 @@ function processLocationPing(payload) {
   } = payload;
 
   const route = fleetRoutes.find((r) => r.routeNo === Number(routeNo));
-  if (!route || !userId) {
+  if (!route || !userId || lat === undefined || lng === undefined) {
     return {
-      sharingStatus: { status: "ERROR", message: "Invalid bus route." },
+      sharingStatus: { status: "ERROR", message: "Invalid location or bus route." },
       telemetry: null
     };
   }
@@ -743,22 +725,11 @@ function processLocationPing(payload) {
     };
   }
 
-  let numLat = Number(lat);
-  let numLng = Number(lng);
-  let correctedForIspDrift = false;
+  const numLat = Number(lat);
+  const numLng = Number(lng);
 
-  const rawDistToCampus = getDistanceMeters(
-    numLat,
-    numLng,
-    SRM_CAMPUS.lat,
-    SRM_CAMPUS.lng
-  );
-  if (Number(accuracy) > 350 || rawDistToCampus > 25000) {
-    numLat = SRM_CAMPUS.lat;
-    numLng = SRM_CAMPUS.lng;
-    correctedForIspDrift = true;
-  }
-
+  // Validate against 500m route corridor OR 1.8km SRM Trichy Campus perimeter
+  // (Never overwrites the user's real GPS coordinate!)
   const validation = validateAgainstRoutePaths(route, numLat, numLng);
   if (!validation.isValid) {
     sharerMap.delete(userId);
@@ -767,14 +738,13 @@ function processLocationPing(payload) {
       sharingStatus: {
         status: "CUTOFF_OUT_OF_ROUTE",
         distanceMeters: Math.round(validation.minDistanceMeters),
-        message: `Live location sharing stopped — you are ${Math.round(
-          validation.minDistanceMeters
-        )}m away from Bus #${String(route.routeNo).padStart(
+        message: `Live location sharing stopped — your current location is ${(
+          validation.minDistanceMeters / 1000
+        ).toFixed(1)} km away from Bus #${String(route.routeNo).padStart(
           2,
           "0"
-        )}'s route (must be within 500m).`
+        )}'s route (must be within 500m of the route to broadcast).`
       },
-      correctedCoords: { lat: numLat, lng: numLng },
       telemetry: computeBestBusTelemetry(route.routeNo)
     };
   }
@@ -804,7 +774,6 @@ function processLocationPing(payload) {
             distFromLiveBus
           )}m away from the moving bus.`
         },
-        correctedCoords: { lat: numLat, lng: numLng },
         telemetry: currentBus
       };
     }
@@ -820,12 +789,12 @@ function processLocationPing(payload) {
       numLat,
       numLng
     );
-    if (stepMeters > 12) {
+    if (stepMeters > 8) {
       totalTraveledMeters += stepMeters;
       if (computedSpeedKmh === 0) {
         const dtSeconds = Math.max(1, (now - existing.timestamp) / 1000);
         const derivedKmh = (stepMeters / dtSeconds) * 3.6;
-        if (derivedKmh >= 4 && derivedKmh <= 110) {
+        if (derivedKmh >= 3 && derivedKmh <= 115) {
           computedSpeedKmh = Math.round(derivedKmh);
         }
       }
@@ -850,7 +819,6 @@ function processLocationPing(payload) {
             message:
               "Arrived at SRM Trichy Campus. Location sharing automatically turned off."
           },
-          correctedCoords: { lat: numLat, lng: numLng },
           telemetry: computeBestBusTelemetry(route.routeNo)
         };
       }
@@ -872,7 +840,6 @@ function processLocationPing(payload) {
             status: "AUTO_STOPPED_DESTINATION",
             message: `Arrived at ${homeStop.name}. Location sharing automatically turned off.`
           },
-          correctedCoords: { lat: numLat, lng: numLng },
           telemetry: computeBestBusTelemetry(route.routeNo)
         };
       }
@@ -891,7 +858,7 @@ function processLocationPing(payload) {
     distanceToRouteMeters: validation.minDistanceMeters,
     matchedPathId: validation.matchedPathId,
     matchedPathName: validation.matchedPathName,
-    accuracy: correctedForIspDrift ? 8 : Number(accuracy) || 10,
+    accuracy: Number(accuracy) || 10,
     speedKmh: computedSpeedKmh,
     homeStopNo: Number(homeStopNo),
     totalTraveledMeters,
@@ -909,13 +876,12 @@ function processLocationPing(payload) {
           ? `Driver Broadcast Active • Bus #${String(route.routeNo).padStart(2, "0")}`
           : `Sharing live location for Bus #${String(route.routeNo).padStart(2, "0")}`
     },
-    correctedCoords: { lat: numLat, lng: numLng },
     telemetry: updatedTelemetry
   };
 }
 
 // ============================================================================
-// 8. AUTHENTICATION & ADMIN ENDPOINTS (Salted Hash Verified)
+// 8. AUTHENTICATION & ADMIN ENDPOINTS
 // ============================================================================
 function requireAdminAuth(req, res, next) {
   const token = req.headers["x-admin-token"];
@@ -927,7 +893,6 @@ function requireAdminAuth(req, res, next) {
   next();
 }
 
-// Public routes never expose password hashes or hints
 function buildPublicRoutesSummary() {
   return fleetRoutes.map((r) => {
     const {
@@ -986,7 +951,6 @@ function getAdminDashboardSnapshot() {
   };
 }
 
-// Driver Login (Verified with Salted Scrypt Hash + Brute-Force Protection)
 app.post(["/api/auth/driver", "/auth/driver"], (req, res) => {
   const clientIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "local";
   const rateCheck = checkRateLimit(clientIp);
@@ -1043,7 +1007,6 @@ app.post(["/api/auth/driver", "/auth/driver"], (req, res) => {
   });
 });
 
-// Admin Login (Verified with Salted Scrypt Hash + Brute-Force Protection)
 app.post(["/api/auth/admin", "/auth/admin"], (req, res) => {
   const clientIp = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "local";
   const rateCheck = checkRateLimit(clientIp);
@@ -1240,7 +1203,7 @@ app.post(["/api/admin/announcement", "/admin/announcement"], requireAdminAuth, (
 });
 
 // ============================================================================
-// 9. HIGH-SCALE PUBLIC ENDPOINTS
+// 9. PUBLIC ENDPOINTS
 // ============================================================================
 app.get(["/api/health", "/health"], (req, res) => {
   res.json({
@@ -1263,7 +1226,7 @@ app.get(["/api/routes", "/routes"], (req, res) => {
 });
 
 app.get(["/api/telemetry/:routeNo", "/telemetry/:routeNo"], (req, res) => {
-  res.set("Cache-Control", "public, s-maxage=2, stale-while-revalidate=3");
+  res.set("Cache-Control", "public, s-maxage=1, stale-while-revalidate=2");
   const rNo = Number(req.params.routeNo);
   const route = fleetRoutes.find((r) => r.routeNo === rNo);
   const telemetry = computeBestBusTelemetry(rNo);
@@ -1388,9 +1351,6 @@ io.on("connection", (socket) => {
       socketId: socket.id
     });
     socket.emit("sharing_status", result.sharingStatus);
-    if (result.correctedCoords) {
-      socket.emit("calibrated_coords", result.correctedCoords);
-    }
     if (result.telemetry) {
       io.to(`room:bus_${result.telemetry.routeNo}`).emit(
         "bus_telemetry_update",

@@ -28,21 +28,27 @@ export default function LiveMap({
   route,
   telemetry,
   myCoords,
+  gpsStatus,
   focusedStop,
   homeStopNo,
   darkMode,
-  onUserDragLocation
+  onRequestFreshGps
 }) {
   const mapContainerRef = useRef(null);
   const mapInstanceRef = useRef(null);
   const routeLayerRef = useRef(null);
-  const dynamicLayerRef = useRef(null);
   const tileLayerRef = useRef(null);
+
+  // Persistent refs for smooth 1-second position updates without flickering
   const userMarkerRef = useRef(null);
+  const userAccuracyCircleRef = useRef(null);
+  const busMarkerRef = useRef(null);
+  const hasCenteredOnUserRef = useRef(false);
   const lastFittedRouteNoRef = useRef(null);
 
   const [mapStyleKey, setMapStyleKey] = useState("google_dark");
   const [showStopLabels, setShowStopLabels] = useState(true);
+  const [followUserMode, setFollowUserMode] = useState(false);
 
   useEffect(() => {
     setMapStyleKey((prev) => {
@@ -55,13 +61,17 @@ export default function LiveMap({
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
     const map = L.map(mapContainerRef.current, {
-      center: [10.9522, 78.7517],
+      center: [10.8505, 78.712],
       zoom: 12,
       zoomControl: false
     });
 
+    // If user manually drags the map, disable auto-follow so they can inspect stops freely
+    map.on("dragstart", () => {
+      setFollowUserMode(false);
+    });
+
     routeLayerRef.current = L.layerGroup().addTo(map);
-    dynamicLayerRef.current = L.layerGroup().addTo(map);
     mapInstanceRef.current = map;
 
     setTimeout(() => map.invalidateSize(), 250);
@@ -90,10 +100,11 @@ export default function LiveMap({
   useEffect(() => {
     const map = mapInstanceRef.current;
     if (!map || !focusedStop) return;
+    setFollowUserMode(false);
     map.flyTo([focusedStop.lat, focusedStop.lng], 15, { duration: 0.75 });
   }, [focusedStop]);
 
-  // Draw Route Polylines & Stops
+  // Draw Route Polylines & Stops (Only re-fits bounds when switching to a different Bus #)
   useEffect(() => {
     const map = mapInstanceRef.current;
     const group = routeLayerRef.current;
@@ -171,33 +182,39 @@ export default function LiveMap({
 
     if (lastFittedRouteNoRef.current !== route.routeNo) {
       lastFittedRouteNoRef.current = route.routeNo;
-      const bounds = L.latLngBounds(route.stops.map((s) => [s.lat, s.lng]));
-      if (myCoords?.lat && myCoords?.lng) {
-        bounds.extend([myCoords.lat, myCoords.lng]);
+      if (!followUserMode) {
+        const bounds = L.latLngBounds(route.stops.map((s) => [s.lat, s.lng]));
+        map.fitBounds(bounds, { padding: [40, 40] });
       }
-      map.fitBounds(bounds, { padding: [40, 40] });
     }
-  }, [route, telemetry?.activePathId, telemetry?.started, showStopLabels, homeStopNo, myCoords]);
+  }, [route, telemetry?.activePathId, telemetry?.started, showStopLabels, homeStopNo, followUserMode]);
 
-  // Render ALWAYS-VISIBLE "📍 YOU" Current Location Pin + Live Bus Pin
+  // Smoothly Update User's Real Hardware GPS Marker ("📍 YOU") Every Second
   useEffect(() => {
-    const dynGroup = dynamicLayerRef.current;
-    if (!dynGroup) return;
-    dynGroup.clearLayers();
+    const map = mapInstanceRef.current;
+    if (!map) return;
 
-    const userLat = myCoords?.lat ?? 10.9522;
-    const userLng = myCoords?.lng ?? 78.7517;
+    if (!myCoords || typeof myCoords.lat !== "number" || typeof myCoords.lng !== "number") {
+      return;
+    }
 
-    // 1. Pulsing Radar Halo around User's Current Location
-    L.circle([userLat, userLng], {
-      radius: 60,
-      color: "#0ea5e9",
-      fillColor: "#38bdf8",
-      fillOpacity: 0.22,
-      weight: 2
-    }).addTo(dynGroup);
+    const latLng = [myCoords.lat, myCoords.lng];
+    const radiusMeters = Math.max(18, Math.min(250, Math.round(myCoords.accuracy || 15)));
 
-    // 2. High-Contrast "📍 YOU" Current Location Pin (zIndexOffset: 5000 so it is always on top!)
+    // Create or smoothly move accuracy halo
+    if (!userAccuracyCircleRef.current) {
+      userAccuracyCircleRef.current = L.circle(latLng, {
+        radius: radiusMeters,
+        color: "#0ea5e9",
+        fillColor: "#38bdf8",
+        fillOpacity: 0.2,
+        weight: 2
+      }).addTo(map);
+    } else {
+      userAccuracyCircleRef.current.setLatLng(latLng);
+      userAccuracyCircleRef.current.setRadius(radiusMeters);
+    }
+
     const userHtml = `
       <div class="orbit-bus-marker" style="
         padding: 0 10px;
@@ -214,7 +231,6 @@ export default function LiveMap({
         gap: 4px;
         white-space: nowrap;
         box-shadow: 0 4px 14px rgba(2,132,199,0.95);
-        cursor: grab;
       ">
         <span style="width:7px;height:7px;border-radius:9999px;background:#38bdf8;border:1.5px solid #fff;display:inline-block"></span>
         <span>📍 YOU</span>
@@ -225,94 +241,111 @@ export default function LiveMap({
       className: "",
       html: userHtml,
       iconSize: [68, 28],
-      iconAnchor: [34, 34] // Positioned cleanly above stop dots so it never gets covered
+      iconAnchor: [34, 14]
     });
 
-    const uMarker = L.marker([userLat, userLng], {
-      icon: userIcon,
-      draggable: true,
-      zIndexOffset: 5000
-    })
-      .bindPopup(
-        `<div style="font-family:sans-serif;color:#0f172a;min-width:160px">
-          <strong style="color:#0284c7">📍 Your Current Location</strong><br/>
-          <span style="font-size:11px">Coords: ${userLat.toFixed(5)}, ${userLng.toFixed(5)}</span><br/>
-          <span style="font-size:10px;color:#475569">Drag this pin to adjust if indoor Wi-Fi drifts</span>
-        </div>`
-      )
-      .addTo(dynGroup);
+    const popupContent = `<div style="font-family:sans-serif;color:#0f172a;min-width:165px">
+      <strong style="color:#0284c7">📍 Your Live GPS Location</strong><br/>
+      <span style="font-size:11px">Lat: ${myCoords.lat.toFixed(5)}, Lng: ${myCoords.lng.toFixed(5)}</span><br/>
+      <span style="font-size:11px">Accuracy: ±${Math.round(myCoords.accuracy || 10)}m • Speed: ${myCoords.speedKmh || 0} km/h</span>
+    </div>`;
 
-    uMarker.on("dragend", (e) => {
-      const pos = e.target.getLatLng();
-      if (onUserDragLocation) {
-        onUserDragLocation({
-          lat: Number(pos.lat.toFixed(6)),
-          lng: Number(pos.lng.toFixed(6))
-        });
+    if (!userMarkerRef.current) {
+      userMarkerRef.current = L.marker(latLng, {
+        icon: userIcon,
+        zIndexOffset: 5000
+      })
+        .bindPopup(popupContent)
+        .addTo(map);
+    } else {
+      userMarkerRef.current.setLatLng(latLng);
+      userMarkerRef.current.setPopupContent(popupContent);
+    }
+
+    // Automatically fly to the user's real GPS location on first lock (e.g. in Dindigul or Trichy)
+    if (!hasCenteredOnUserRef.current) {
+      hasCenteredOnUserRef.current = true;
+      map.flyTo(latLng, 15, { duration: 0.9 });
+    } else if (followUserMode) {
+      map.panTo(latLng, { animate: true, duration: 0.5 });
+    }
+  }, [myCoords, followUserMode]);
+
+  // Smoothly Update Live Bus Marker Every Second
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+
+    if (!telemetry || !telemetry.started) {
+      if (busMarkerRef.current) {
+        map.removeLayer(busMarkerRef.current);
+        busMarkerRef.current = null;
       }
+      return;
+    }
+
+    const busLatLng = [telemetry.lat, telemetry.lng];
+    const busHtml = `
+      <div class="orbit-bus-marker" style="
+        padding: 0 11px;
+        height: 34px;
+        border-radius: 9999px;
+        background: #0f172a;
+        border: 2.5px solid #10b981;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+        color: #f8fafc;
+        font-weight: 800;
+        font-size: 11px;
+        white-space: nowrap;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.65);
+      ">
+        <span style="width:7px;height:7px;border-radius:9999px;background:#10b981;display:inline-block"></span>
+        <span>BUS #${String(telemetry.routeNo).padStart(2, "0")}</span>
+      </div>
+    `;
+
+    const busIcon = L.divIcon({
+      className: "",
+      html: busHtml,
+      iconSize: [86, 34],
+      iconAnchor: [43, 17]
     });
 
-    userMarkerRef.current = uMarker;
+    const popupHtml = `<div style="font-family:sans-serif;color:#0f172a">
+      <strong>BUS #${String(telemetry.routeNo).padStart(2, "0")} LIVE</strong><br/>
+      <span>Speed: ${telemetry.speedKmh} km/h</span><br/>
+      <span>Current Stop: ${telemetry.currentStopName}</span>
+    </div>`;
 
-    // 3. Live Bus Marker (Only when bus has started)
-    if (telemetry && telemetry.started) {
-      const busHtml = `
-        <div class="orbit-bus-marker" style="
-          padding: 0 11px;
-          height: 34px;
-          border-radius: 9999px;
-          background: #0f172a;
-          border: 2.5px solid #10b981;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          gap: 5px;
-          color: #f8fafc;
-          font-weight: 800;
-          font-size: 11px;
-          white-space: nowrap;
-          box-shadow: 0 4px 14px rgba(0,0,0,0.65);
-        ">
-          <span style="width:7px;height:7px;border-radius:9999px;background:#10b981;display:inline-block"></span>
-          <span>BUS #${String(telemetry.routeNo).padStart(2, "0")}</span>
-        </div>
-      `;
-
-      const busIcon = L.divIcon({
-        className: "",
-        html: busHtml,
-        iconSize: [86, 34],
-        iconAnchor: [43, 10]
-      });
-
-      L.marker([telemetry.lat, telemetry.lng], {
+    if (!busMarkerRef.current) {
+      busMarkerRef.current = L.marker(busLatLng, {
         icon: busIcon,
         zIndexOffset: 3000
       })
-        .bindPopup(
-          `<div style="font-family:sans-serif;color:#0f172a">
-            <strong>BUS #${String(telemetry.routeNo).padStart(2, "0")} LIVE</strong><br/>
-            <span>Speed: ${telemetry.speedKmh} km/h</span><br/>
-            <span>Current Stop: ${telemetry.currentStopName}</span>
-          </div>`
-        )
-        .addTo(dynGroup);
+        .bindPopup(popupHtml)
+        .addTo(map);
+    } else {
+      busMarkerRef.current.setLatLng(busLatLng);
+      busMarkerRef.current.setIcon(busIcon);
+      busMarkerRef.current.setPopupContent(popupHtml);
     }
-  }, [telemetry, myCoords, onUserDragLocation]);
+  }, [telemetry]);
 
   function handleTopViewRoute() {
     const map = mapInstanceRef.current;
     if (!map || !route) return;
+    setFollowUserMode(false);
     const bounds = L.latLngBounds(route.stops.map((s) => [s.lat, s.lng]));
-    if (myCoords?.lat && myCoords?.lng) {
-      bounds.extend([myCoords.lat, myCoords.lng]);
-    }
     map.flyToBounds(bounds, { padding: [42, 42], duration: 0.8 });
   }
 
   function handleFocusBus() {
     const map = mapInstanceRef.current;
     if (!map) return;
+    setFollowUserMode(false);
     if (telemetry && telemetry.started) {
       map.flyTo([telemetry.lat, telemetry.lng], 15, { duration: 0.75 });
     } else {
@@ -321,14 +354,14 @@ export default function LiveMap({
   }
 
   function handleFocusMyLocation() {
+    if (onRequestFreshGps) onRequestFreshGps();
     const map = mapInstanceRef.current;
-    if (!map) return;
-    const uLat = myCoords?.lat ?? 10.9522;
-    const uLng = myCoords?.lng ?? 78.7517;
-    map.flyTo([uLat, uLng], 15, { duration: 0.75 });
+    if (!map || !myCoords?.lat) return;
+    setFollowUserMode(true);
+    map.flyTo([myCoords.lat, myCoords.lng], 16, { duration: 0.75 });
     setTimeout(() => {
       userMarkerRef.current?.openPopup();
-    }, 600);
+    }, 650);
   }
 
   const currentStyle = MAP_STYLES[mapStyleKey] || MAP_STYLES.google_dark;
@@ -341,7 +374,7 @@ export default function LiveMap({
     >
       <div ref={mapContainerRef} className="w-full h-full" />
 
-      {/* Top-Left Live Status Pill */}
+      {/* Top-Left Live Bus + Live GPS Status Pills */}
       <div className="absolute top-3 left-3 z-[400] flex flex-col gap-1.5 pointer-events-none">
         <div className="px-3 py-1.5 rounded-xl backdrop-blur-xl bg-slate-900/85 text-slate-100 border border-white/10 shadow-lg text-[11px] font-semibold flex items-center gap-2">
           {telemetry && telemetry.started ? (
@@ -360,6 +393,15 @@ export default function LiveMap({
               </span>
             </>
           )}
+        </div>
+
+        {/* Live Hardware GPS Coordinate Readout Pill */}
+        <div className="px-2.5 py-1 rounded-xl backdrop-blur-xl bg-slate-900/80 text-sky-300 border border-sky-500/30 shadow text-[10px] font-mono">
+          {myCoords?.lat
+            ? `📍 YOU: ${myCoords.lat.toFixed(5)}, ${myCoords.lng.toFixed(5)} (±${Math.round(
+                myCoords.accuracy || 10
+              )}m)`
+            : gpsStatus || "Acquiring Phone GPS..."}
         </div>
       </div>
 
@@ -381,14 +423,18 @@ export default function LiveMap({
           ))}
         </div>
 
-        {/* Dedicated "My Location" Button */}
+        {/* Dedicated "My Location" Button (Locks onto Your Live Movement) */}
         <button
           onClick={handleFocusMyLocation}
-          title="Zoom to Your Current Location (📍 YOU)"
-          className="px-2.5 py-2 rounded-xl backdrop-blur-xl bg-sky-600/90 hover:bg-sky-500 text-white border border-sky-400/40 shadow-lg transition flex items-center gap-1 text-[11px] font-bold"
+          title="Zoom & Lock onto Your Live GPS Location (📍 YOU)"
+          className={`px-2.5 py-2 rounded-xl backdrop-blur-xl border shadow-lg transition flex items-center gap-1 text-[11px] font-bold ${
+            followUserMode
+              ? "bg-sky-500 text-slate-950 border-white"
+              : "bg-sky-600/90 hover:bg-sky-500 text-white border-sky-400/40"
+          }`}
         >
           <LocateFixed className="w-3.5 h-3.5" />
-          <span>My Location</span>
+          <span>{followUserMode ? "Following You" : "My Location"}</span>
         </button>
 
         <button
@@ -397,7 +443,7 @@ export default function LiveMap({
           className="px-2.5 py-2 rounded-xl backdrop-blur-xl bg-slate-900/85 hover:bg-slate-800 text-slate-200 border border-white/10 shadow-lg transition flex items-center gap-1 text-[11px] font-semibold"
         >
           <Maximize2 className="w-3.5 h-3.5 text-sky-400" />
-          <span className="hidden sm:inline">Top View</span>
+          <span className="hidden sm:inline">Route View</span>
         </button>
 
         <button

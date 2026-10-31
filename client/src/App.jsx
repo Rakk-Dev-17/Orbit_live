@@ -38,8 +38,6 @@ import {
 } from "lucide-react";
 import LiveMap from "./components/LiveMap.jsx";
 
-const SRM_TRICHY_CAMPUS = { lat: 10.9522, lng: 78.7517 };
-
 const DEFAULT_ADMINS = [
   { id: "admin_1", label: "Admin 1 - Pavithrraraj", name: "Pavithrraraj" },
   { id: "admin_2", label: "Admin 2 - Jeffrey", name: "Jeffrey" },
@@ -483,7 +481,7 @@ function GlassDropdown({
 }
 
 // ============================================================================
-// 4. ADMIN COMMAND CENTER VIEW (With Call Driver Option Included)
+// 4. ADMIN COMMAND CENTER VIEW
 // ============================================================================
 function AdminDashboard({
   adminUser,
@@ -1385,26 +1383,32 @@ export default function App() {
   const [activeBuses, setActiveBuses] = useState([]);
   const [isSharing, setIsSharing] = useState(false);
 
-  // Initialize myCoords immediately so the "📍 YOU" pin is ALWAYS visible on the map!
-  const [myCoords, setMyCoords] = useState(() => ({
-    lat: SRM_TRICHY_CAMPUS.lat,
-    lng: SRM_TRICHY_CAMPUS.lng,
-    accuracy: 10,
-    speedKmh: 0
-  }));
-  const [manualOverrideCoords, setManualOverrideCoords] = useState(null);
+  // Real Hardware GPS State (No fake SRM_TRICHY_CAMPUS override!)
+  const [myCoords, setMyCoords] = useState(() => {
+    try {
+      const cached = localStorage.getItem("orbitlive_last_real_gps");
+      return cached ? JSON.parse(cached) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [gpsStatus, setGpsStatus] = useState("Locating your GPS...");
   const [sharingFeedback, setSharingFeedback] = useState(null);
   const [proximityAlertBanner, setProximityAlertBanner] = useState(null);
   const [focusedStop, setFocusedStop] = useState(null);
   const [sheetExpanded, setSheetExpanded] = useState(false);
 
   const socketRef = useRef(null);
-  const watchIdRef = useRef(null);
-  const heartbeatTimerRef = useRef(null);
+  const prevGpsRef = useRef(null);
+  const isSharingRef = useRef(false);
   const alertedStateRef = useRef({
     nextStopAlertedForRoute: null,
     delayAlertedForRoute: null
   });
+
+  useEffect(() => {
+    isSharingRef.current = isSharing;
+  }, [isSharing]);
 
   const userIdRef = useRef(
     localStorage.getItem("orbitlive_uid") ||
@@ -1422,8 +1426,7 @@ export default function App() {
     role: savedUser?.role || "STUDENT",
     driverToken: savedUser?.driverToken || "",
     driverPhone: savedUser?.driverPhone || "",
-    myCoords,
-    manualOverrideCoords
+    myCoords
   });
 
   useEffect(() => {
@@ -1434,53 +1437,125 @@ export default function App() {
       role: savedUser?.role || "STUDENT",
       driverToken: savedUser?.driverToken || "",
       driverPhone: savedUser?.driverPhone || "",
-      myCoords,
-      manualOverrideCoords
+      myCoords
     };
-  }, [selectedRouteNo, homeStopNo, savedUser, myCoords, manualOverrideCoords]);
+  }, [selectedRouteNo, homeStopNo, savedUser, myCoords]);
 
-  // Passive Own-Location Tracker:
-  // Keeps the "📍 YOU" pin updated on the map even before clicking Share Live Location!
-  useEffect(() => {
-    if (!("geolocation" in navigator)) return;
+  // ==========================================================================
+  // 1-SECOND REAL HARDWARE GPS ENGINE (Updates "📍 YOU" Every Second as You Move)
+  // ==========================================================================
+  function applyHardwareGpsPosition(pos) {
+    const { latitude, longitude, accuracy, speed } = pos.coords;
+    const now = Date.now();
 
-    const passiveWatchId = navigator.geolocation.watchPosition(
-      (pos) => {
-        if (latestConfigRef.current.manualOverrideCoords) return;
-        let { latitude, longitude, accuracy, speed } = pos.coords;
-        const distFromCampus = getDistanceMetersClient(
-          latitude,
-          longitude,
-          SRM_TRICHY_CAMPUS.lat,
-          SRM_TRICHY_CAMPUS.lng
-        );
+    // Calculate real movement speed if mobile OS returns speed === null
+    let computedSpeedKmh =
+      speed !== null && speed !== undefined && speed >= 0.4
+        ? Math.round(speed * 3.6)
+        : 0;
 
-        // Filter out coarse Windows laptop ISP drift (>350m accuracy or >25km ISP jump)
-        if ((accuracy && accuracy > 350) || distFromCampus > 25000) {
-          latitude = SRM_TRICHY_CAMPUS.lat;
-          longitude = SRM_TRICHY_CAMPUS.lng;
-          accuracy = 10;
-        }
+    if (computedSpeedKmh === 0 && prevGpsRef.current) {
+      const dtSec = Math.max(0.5, (now - prevGpsRef.current.ts) / 1000);
+      const distM = getDistanceMetersClient(
+        prevGpsRef.current.lat,
+        prevGpsRef.current.lng,
+        latitude,
+        longitude
+      );
+      if (distM > 2.5 && dtSec <= 10) {
+        const derived = Math.round((distM / dtSec) * 3.6);
+        if (derived <= 120) computedSpeedKmh = derived;
+      }
+    }
 
-        const realSpeed = speed && speed > 0.5 ? Math.round(speed * 3.6) : 0;
-        setMyCoords({
-          lat: latitude,
-          lng: longitude,
-          accuracy: accuracy || 10,
-          speedKmh: realSpeed
-        });
-      },
-      () => {
-        // Keep SRM Trichy Campus default if browser geolocation is denied
+    prevGpsRef.current = { lat: latitude, lng: longitude, ts: now };
+
+    const nextCoord = {
+      lat: Number(latitude.toFixed(6)),
+      lng: Number(longitude.toFixed(6)),
+      accuracy: Math.round(accuracy || 10),
+      speedKmh: computedSpeedKmh,
+      ts: now
+    };
+
+    setMyCoords(nextCoord);
+    setGpsStatus("Live GPS Locked");
+    try {
+      localStorage.setItem("orbitlive_last_real_gps", JSON.stringify(nextCoord));
+    } catch {
+      // Ignore storage error
+    }
+
+    // If user is currently broadcasting to a bus, transmit their new coordinate immediately
+    if (isSharingRef.current) {
+      transmitLocationPing(
+        nextCoord.lat,
+        nextCoord.lng,
+        nextCoord.accuracy,
+        nextCoord.speedKmh
+      );
+    }
+  }
+
+  function requestFreshHardwareGps() {
+    if (!("geolocation" in navigator)) {
+      setGpsStatus("Geolocation not supported by browser");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      applyHardwareGpsPosition,
+      (err) => {
+        setGpsStatus(`Enable Location Permission (${err.message})`);
       },
       {
         enableHighAccuracy: true,
-        maximumAge: 5000,
+        maximumAge: 0,
+        timeout: 8000
+      }
+    );
+  }
+
+  useEffect(() => {
+    if (!("geolocation" in navigator)) {
+      setGpsStatus("Geolocation not supported");
+      return;
+    }
+
+    // 1. Immediate lock on mount
+    requestFreshHardwareGps();
+
+    // 2. Continuous hardware watcher
+    const watchId = navigator.geolocation.watchPosition(
+      applyHardwareGpsPosition,
+      (err) => {
+        setGpsStatus(`GPS Permission Required (${err.message})`);
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 0,
         timeout: 8000
       }
     );
 
-    return () => navigator.geolocation.clearWatch(passiveWatchId);
+    // 3. 1-Second active poll so phones & laptops refresh movement every single second
+    const oneSecondGpsTimer = setInterval(() => {
+      if (document.hidden) return;
+      navigator.geolocation.getCurrentPosition(
+        applyHardwareGpsPosition,
+        () => {},
+        {
+          enableHighAccuracy: true,
+          maximumAge: 0,
+          timeout: 4000
+        }
+      );
+    }, 1000);
+
+    return () => {
+      navigator.geolocation.clearWatch(watchId);
+      clearInterval(oneSecondGpsTimer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -1540,12 +1615,6 @@ export default function App() {
       }
     });
 
-    socket.on("calibrated_coords", (coords) => {
-      if (coords?.lat && coords?.lng) {
-        setMyCoords({ lat: coords.lat, lng: coords.lng, accuracy: 8 });
-      }
-    });
-
     socket.on("active_buses_overview", (list) => {
       if (Array.isArray(list)) setActiveBuses(list);
     });
@@ -1578,7 +1647,7 @@ export default function App() {
           }
         })
         .catch(() => {});
-    }, 3000);
+    }, 2000);
 
     const presenceTimer = setInterval(() => {
       if (document.hidden) return;
@@ -1766,7 +1835,7 @@ export default function App() {
   function transmitLocationPing(
     lat,
     lng,
-    accuracy = 8,
+    accuracy = 10,
     speedKmh = 0,
     overrideRouteNo = null
   ) {
@@ -1794,13 +1863,16 @@ export default function App() {
     })
       .then((r) => r.json())
       .then((res) => {
-        if (res?.sharingStatus) setSharingFeedback(res.sharingStatus);
-        if (res?.correctedCoords) {
-          setMyCoords({
-            lat: res.correctedCoords.lat,
-            lng: res.correctedCoords.lng,
-            accuracy: 8
-          });
+        if (res?.sharingStatus) {
+          setSharingFeedback(res.sharingStatus);
+          if (
+            res.sharingStatus.status === "CUTOFF_OUT_OF_ROUTE" ||
+            res.sharingStatus.status === "CUTOFF_AWAY_FROM_BUS" ||
+            res.sharingStatus.status === "AUTO_STOPPED_DESTINATION"
+          ) {
+            setIsSharing(false);
+            isSharingRef.current = false;
+          }
         }
         if (res?.telemetry && res.telemetry.started) {
           setTelemetry(res.telemetry);
@@ -1810,89 +1882,26 @@ export default function App() {
   }
 
   function startLiveLocationSharing() {
-    if (watchIdRef.current !== null || heartbeatTimerRef.current !== null) {
+    if (!myCoords?.lat || !myCoords?.lng) {
+      requestFreshHardwareGps();
+      setSharingFeedback({
+        status: "ERROR",
+        message: "Acquiring your real GPS location first — please allow location access."
+      });
       return;
     }
+
     setIsSharing(true);
-
-    const initialCoord = manualOverrideCoords || myCoords || SRM_TRICHY_CAMPUS;
-    transmitLocationPing(initialCoord.lat, initialCoord.lng, 8, 0);
-
-    if ("geolocation" in navigator) {
-      watchIdRef.current = navigator.geolocation.watchPosition(
-        (pos) => {
-          if (latestConfigRef.current.manualOverrideCoords) return;
-
-          let { latitude, longitude, accuracy, speed } = pos.coords;
-          const distFromCampus = getDistanceMetersClient(
-            latitude,
-            longitude,
-            SRM_TRICHY_CAMPUS.lat,
-            SRM_TRICHY_CAMPUS.lng
-          );
-
-          if ((accuracy && accuracy > 350) || distFromCampus > 25000) {
-            latitude = SRM_TRICHY_CAMPUS.lat;
-            longitude = SRM_TRICHY_CAMPUS.lng;
-            accuracy = 8;
-          }
-
-          const realSpeedKmh =
-            speed && speed > 0.5 ? Math.round(speed * 3.6) : 0;
-
-          setMyCoords({
-            lat: latitude,
-            lng: longitude,
-            accuracy: accuracy || 8,
-            speedKmh: realSpeedKmh
-          });
-          transmitLocationPing(
-            latitude,
-            longitude,
-            accuracy || 8,
-            realSpeedKmh
-          );
-        },
-        () => {
-          setMyCoords({ ...SRM_TRICHY_CAMPUS, speedKmh: 0 });
-          transmitLocationPing(
-            SRM_TRICHY_CAMPUS.lat,
-            SRM_TRICHY_CAMPUS.lng,
-            8,
-            0
-          );
-        },
-        {
-          enableHighAccuracy: true,
-          maximumAge: 0,
-          timeout: 8000
-        }
-      );
-    }
-
-    heartbeatTimerRef.current = setInterval(() => {
-      const activePos =
-        latestConfigRef.current.manualOverrideCoords ||
-        latestConfigRef.current.myCoords ||
-        SRM_TRICHY_CAMPUS;
-      transmitLocationPing(
-        activePos.lat,
-        activePos.lng,
-        8,
-        activePos.speedKmh || 0
-      );
-    }, 3000);
+    isSharingRef.current = true;
+    transmitLocationPing(
+      myCoords.lat,
+      myCoords.lng,
+      myCoords.accuracy || 10,
+      myCoords.speedKmh || 0
+    );
   }
 
   function stopLiveLocationSharing(clearMessage = true) {
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-    }
-    if (heartbeatTimerRef.current !== null) {
-      clearInterval(heartbeatTimerRef.current);
-      heartbeatTimerRef.current = null;
-    }
     const rNo = latestConfigRef.current.selectedRouteNo;
     socketRef.current?.emit("stop_sharing", {
       routeNo: rNo,
@@ -1905,15 +1914,8 @@ export default function App() {
     }).catch(() => {});
 
     setIsSharing(false);
+    isSharingRef.current = false;
     if (clearMessage) setSharingFeedback(null);
-  }
-
-  function handleUserDragLocation(newCoords) {
-    setManualOverrideCoords(newCoords);
-    setMyCoords({ lat: newCoords.lat, lng: newCoords.lng, accuracy: 5, speedKmh: 0 });
-    if (isSharing) {
-      transmitLocationPing(newCoords.lat, newCoords.lng, 5, 0);
-    }
   }
 
   function handleStudentLoginSubmit(e) {
@@ -2015,7 +2017,6 @@ export default function App() {
 
   function handleLogout() {
     stopLiveLocationSharing(true);
-    setManualOverrideCoords(null);
     localStorage.removeItem("orbitlive_user_v4");
     setSavedUser(null);
     setDriverPasswordInput("");
@@ -2353,7 +2354,7 @@ export default function App() {
   }
 
   // ==========================================================================
-  // VIEW 3: MAIN LIVE RADAR UI (Shared by Students, Drivers & Admin Map View)
+  // VIEW 3: MAIN LIVE RADAR UI
   // ==========================================================================
   const busStarted = Boolean(telemetry && telemetry.started);
   const currentSpeedKmh = busStarted ? Math.max(0, telemetry.speedKmh || 0) : 0;
@@ -2364,10 +2365,6 @@ export default function App() {
   const activeDriverName =
     telemetry?.driverName || currentRoute?.driverName || "Driver";
 
-  // Show "Call Driver" ONLY to:
-  // 1. Students assigned to this specific bus (Number(selectedRouteNo) === Number(savedUser.routeNo))
-  // 2. Admins inspecting the bus
-  // NEVER show "Call Driver" on the Driver's own window!
   const canSeeCallDriver =
     Boolean(activeDriverPhone) &&
     savedUser.role !== "DRIVER" &&
@@ -2518,10 +2515,11 @@ export default function App() {
           route={currentRoute}
           telemetry={telemetry}
           myCoords={myCoords}
+          gpsStatus={gpsStatus}
           focusedStop={focusedStop}
           homeStopNo={homeStopNo}
           darkMode={darkMode}
-          onUserDragLocation={handleUserDragLocation}
+          onRequestFreshGps={requestFreshHardwareGps}
         />
       </div>
 
@@ -2578,7 +2576,6 @@ export default function App() {
             </div>
           </button>
 
-          {/* CALL DRIVER BAR: Shown ONLY for Students on this Bus & Admins (Hidden on Driver Screen) */}
           {canSeeCallDriver && (
             <div className="mb-2 px-3 py-2 rounded-2xl backdrop-blur-xl bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-between text-xs">
               <div className="flex items-center gap-2 min-w-0">
